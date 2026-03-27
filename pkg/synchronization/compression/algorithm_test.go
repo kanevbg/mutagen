@@ -1,6 +1,8 @@
 package compression
 
 import (
+	"bytes"
+	"io"
 	"testing"
 )
 
@@ -89,6 +91,46 @@ func TestAlgorithmDescription(t *testing.T) {
 				description,
 				testCase.expected,
 			)
+		}
+	}
+}
+
+// TestAlgorithmRoundTrip verifies compression/decompression round-tripping for
+// supported algorithms.
+func TestAlgorithmRoundTrip(t *testing.T) {
+	testCases := []Algorithm{
+		Algorithm_AlgorithmNone,
+		Algorithm_AlgorithmDeflate,
+		Algorithm_AlgorithmZstandard,
+	}
+
+	payload := []byte("mutagen-compression-round-trip-payload")
+
+	for _, algorithm := range testCases {
+		if algorithm.SupportStatus() != AlgorithmSupportStatusSupported {
+			continue
+		}
+
+		var compressed bytes.Buffer
+		compressor := algorithm.Compress(&compressed)
+		if _, err := compressor.Write(payload); err != nil {
+			t.Fatalf("unable to compress payload with %s: %v", algorithm, err)
+		}
+		if err := compressor.Close(); err != nil {
+			t.Fatalf("unable to close compressor for %s: %v", algorithm, err)
+		}
+
+		decompressor := algorithm.Decompress(&compressed)
+		result, err := io.ReadAll(decompressor)
+		if err != nil {
+			t.Fatalf("unable to decompress payload with %s: %v", algorithm, err)
+		}
+		if err := decompressor.Close(); err != nil {
+			t.Fatalf("unable to close decompressor for %s: %v", algorithm, err)
+		}
+
+		if !bytes.Equal(result, payload) {
+			t.Fatalf("decompressed data mismatch for %s", algorithm)
 		}
 	}
 }
