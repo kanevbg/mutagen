@@ -392,8 +392,9 @@ func (c *endpointClient) Stage(ctx context.Context, paths []string, digests [][]
 	}
 
 	// Receive the response while monitoring for cancellation. If cancellation
-	// occurs, then forcibly close the endpoint stream to unblock the remote
-	// side, because the stage protocol has no out-of-band completion signal.
+	// occurs before the response arrives, then forcibly close the endpoint
+	// stream to unblock the remote side, because the stage protocol doesn't
+	// provide a pre-response completion signal.
 	response := &StageResponse{}
 	responseReceiveErrors := make(chan error, 1)
 	go func() {
@@ -441,14 +442,6 @@ func (c *endpointClient) Stage(ctx context.Context, paths []string, digests [][]
 		}
 		return nil, nil, nil, nil
 	}
-
-	// If the stage is cancelled after the response has been received but before
-	// transmission is finalized, then signal completion so that the remote side
-	// can tear down promptly without forcing full connection closure.
-	go func() {
-		<-ctx.Done()
-		signaler.signal()
-	}()
 
 	// Create an encoding receiver that can transmit rsync operations to the
 	// remote.

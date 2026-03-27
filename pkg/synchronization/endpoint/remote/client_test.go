@@ -78,7 +78,7 @@ func TestClientStageNoOpSendsCompletionMarker(t *testing.T) {
 	}
 }
 
-func TestClientStageCancellationBeforeSupplySendsCompletionMarker(t *testing.T) {
+func TestClientStageReceiverFinalizationSendsCompletionMarker(t *testing.T) {
 	clientConnection, serverConnection := net.Pipe()
 	defer clientConnection.Close()
 	defer serverConnection.Close()
@@ -129,15 +129,16 @@ func TestClientStageCancellationBeforeSupplySendsCompletionMarker(t *testing.T) 
 		}
 	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	paths, signatures, receiver, err := client.Stage(ctx, []string{"file"}, [][]byte{{1}})
+	paths, signatures, receiver, err := client.Stage(context.Background(), []string{"file"}, [][]byte{{1}})
 	if err != nil {
 		t.Fatal("stage failed:", err)
 	} else if len(paths) != 1 || len(signatures) != 1 || receiver == nil {
-		t.Fatal("unexpected staging result for cancellable stage")
+		t.Fatal("unexpected staging result for finalizable stage")
 	}
 
-	cancel()
+	if err := rsync.FinalizeReceiver(receiver); err != nil {
+		t.Fatal("unable to finalize stage receiver:", err)
+	}
 
 	select {
 	case err := <-serverResults:
@@ -145,6 +146,6 @@ func TestClientStageCancellationBeforeSupplySendsCompletionMarker(t *testing.T) 
 			t.Fatal("server validation failed:", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("server did not observe stage completion marker after cancellation")
+		t.Fatal("server did not observe stage completion marker after receiver finalization")
 	}
 }

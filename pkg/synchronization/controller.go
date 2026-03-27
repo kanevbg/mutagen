@@ -859,6 +859,12 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.stateLock.UnlockWithoutNotify()
 	}
 
+	finalizeAbandonedStagingReceiver := func(side string, receiver rsync.Receiver) {
+		if err := rsync.FinalizeReceiver(receiver); err != nil {
+			c.logger.Debugf("Unable to finalize abandoned %s staging receiver: %v", side, err)
+		}
+	}
+
 	// Track whether or not a flush request triggered the synchronization loop.
 	var flushRequest chan error
 
@@ -1265,6 +1271,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			if len(filteredPaths) > 0 {
 				select {
 				case <-ctx.Done():
+					finalizeAbandonedStagingReceiver("alpha", receiver)
 					return errors.New("cancelled before alpha supply")
 				default:
 				}
@@ -1314,6 +1321,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			if len(filteredPaths) > 0 {
 				select {
 				case <-ctx.Done():
+					finalizeAbandonedStagingReceiver("beta", receiver)
 					return errors.New("cancelled before beta supply")
 				default:
 				}
