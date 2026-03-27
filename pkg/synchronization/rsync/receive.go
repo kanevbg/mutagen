@@ -45,6 +45,14 @@ type Receiver interface {
 	finalize() error
 }
 
+// FinalizeReceiver finalizes a receiver from outside the rsync package.
+func FinalizeReceiver(receiver Receiver) error {
+	if receiver == nil {
+		return nil
+	}
+	return receiver.finalize()
+}
+
 // Sinker provides the interface for a receiver to store incoming files.
 type Sinker interface {
 	// Sink should return a new io.WriteCloser for staging the given path. Each

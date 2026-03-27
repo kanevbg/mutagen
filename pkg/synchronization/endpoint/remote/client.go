@@ -417,8 +417,12 @@ func (c *endpointClient) Stage(ctx context.Context, paths []string, digests [][]
 		return nil, nil, nil, fmt.Errorf("stage cancelled: %w", ctx.Err())
 	}
 
+	// Create a stage completion signaler for whichever follow-up path we take.
+	signaler := newStageCompletionSignaler(c.encoder, c.flusher)
+
 	// Check for remote errors.
 	if response.Error != "" {
+		_ = signaler.signal()
 		return nil, nil, nil, fmt.Errorf("remote error: %s", response.Error)
 	}
 
@@ -432,12 +436,26 @@ func (c *endpointClient) Stage(ctx context.Context, paths []string, digests [][]
 	// If everything was already staged, then we can abort the staging
 	// operation.
 	if len(requiredPaths) == 0 {
+		if err := signaler.signal(); err != nil {
+			return nil, nil, nil, err
+		}
 		return nil, nil, nil, nil
 	}
 
+	// If the stage is cancelled after the response has been received but before
+	// transmission is finalized, then signal completion so that the remote side
+	// can tear down promptly without forcing full connection closure.
+	go func() {
+		<-ctx.Done()
+		signaler.signal()
+	}()
+
 	// Create an encoding receiver that can transmit rsync operations to the
 	// remote.
-	encoder := &protobufRsyncEncoder{encoder: c.encoder, flusher: c.flusher}
+	encoder := &stageCompletionEncoder{
+		encoder:  &protobufRsyncEncoder{encoder: c.encoder, flusher: c.flusher},
+		signaler: signaler,
+	}
 	receiver := rsync.NewEncodingReceiver(encoder)
 
 	// Success.

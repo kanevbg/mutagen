@@ -366,17 +366,74 @@ func (s *endpointServer) serveStage(request *StageRequest) error {
 		return fmt.Errorf("invalid stage request: %w", err)
 	}
 
-	// Begin staging.
-	paths, signatures, receiver, err := s.endpoint.Stage(context.Background(), request.Paths, request.Digests)
-	if err != nil {
-		s.encodeAndFlush(&StageResponse{Error: err.Error()})
-		return fmt.Errorf("unable to begin staging: %w", err)
+	// Create a cancellable context for executing the stage initialization.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start decoding the next inbound stage message. We intentionally keep only
+	// one in-flight receive operation at a time so that the stage protocol can
+	// hand stream ownership back to the main serve loop without decoder races.
+	nextStageMessage := receiveStageTransmissionAsync(s.decoder)
+
+	// Start staging asynchronously so that transport closure can cancel local
+	// stage initialization while it is waiting on filesystem work.
+	type stageInitializationResult struct {
+		paths      []string
+		signatures []*rsync.Signature
+		receiver   rsync.Receiver
+		err        error
+	}
+	stageInitializationResults := make(chan stageInitializationResult, 1)
+	go func() {
+		paths, signatures, receiver, err := s.endpoint.Stage(ctx, request.Paths, request.Digests)
+		stageInitializationResults <- stageInitializationResult{
+			paths:      paths,
+			signatures: signatures,
+			receiver:   receiver,
+			err:        err,
+		}
+	}()
+
+	// Wait for either stage initialization to finish or the transport to break.
+	stageInitialization := stageInitializationResult{}
+	cancelledBeforeResponse := false
+	select {
+	case stageInitialization = <-stageInitializationResults:
+	case next := <-nextStageMessage:
+		cancel()
+		if next.err != nil {
+			<-stageInitializationResults
+			return next.err
+		} else if isStageCompletionTransmission(next.transmission) {
+			cancelledBeforeResponse = true
+			stageInitialization = <-stageInitializationResults
+		} else {
+			<-stageInitializationResults
+			return errors.New("unexpected stage message received before response")
+		}
+	}
+
+	// If stage initialization was cancelled before the response was sent, then
+	// acknowledge the cancellation and keep the connection alive.
+	if cancelledBeforeResponse {
+		err := stageInitialization.err
+		if err == nil {
+			err = errors.New("stage cancelled")
+		}
+		if err = s.encodeAndFlush(&StageResponse{Error: err.Error()}); err != nil {
+			return fmt.Errorf("unable to send stage cancellation response: %w", err)
+		}
+		return nil
 	}
 
 	// If all of the requested paths are required, then we'll signal this in the
 	// response by using an empty path list. This is an important heuristic to
 	// reduce response size on initial staging.
-	responsePaths := paths
+	if stageInitialization.err != nil {
+		s.encodeAndFlush(&StageResponse{Error: stageInitialization.err.Error()})
+		return fmt.Errorf("unable to begin staging: %w", stageInitialization.err)
+	}
+	responsePaths := stageInitialization.paths
 	if len(responsePaths) == len(request.Paths) {
 		responsePaths = nil
 	}
@@ -384,23 +441,41 @@ func (s *endpointServer) serveStage(request *StageRequest) error {
 	// Send the response.
 	response := &StageResponse{
 		Paths:      responsePaths,
-		Signatures: signatures,
+		Signatures: stageInitialization.signatures,
 	}
-	if err = s.encodeAndFlush(response); err != nil {
+	if err := s.encodeAndFlush(response); err != nil {
+		rsync.FinalizeReceiver(stageInitialization.receiver)
 		return fmt.Errorf("unable to send stage response: %w", err)
 	}
 
 	// If there weren't any paths requiring staging, then we're done.
-	if len(paths) == 0 {
+	if len(stageInitialization.paths) == 0 {
+		if err := receiveStageCompletion(nextStageMessage); err != nil {
+			return err
+		}
 		return nil
 	}
 
-	// The remote side of the connection should now forward rsync operations, so
-	// we need to decode and forward them to the receiver. If this operation
-	// completes successfully, staging is complete and successful.
-	decoder := &protobufRsyncDecoder{decoder: s.decoder}
-	if err = rsync.DecodeToReceiver(decoder, uint64(len(paths)), receiver); err != nil {
-		return fmt.Errorf("unable to decode and forward rsync operations: %w", err)
+	// Decode and forward staged file data. If a stage completion marker arrives
+	// before the data stream finishes, then treat that as a cancellation.
+	var cancelledDuringTransfer bool
+	var err error
+	nextStageMessage, cancelledDuringTransfer, err = decodeStageOperations(
+		nextStageMessage,
+		s.decoder,
+		uint64(len(stageInitialization.paths)),
+		stageInitialization.receiver,
+	)
+	if err != nil {
+		return err
+	} else if cancelledDuringTransfer {
+		return nil
+	}
+
+	// Wait for the explicit completion marker that follows a successful staged
+	// data transfer.
+	if err := receiveStageCompletion(nextStageMessage); err != nil {
+		return err
 	}
 
 	// Success.
