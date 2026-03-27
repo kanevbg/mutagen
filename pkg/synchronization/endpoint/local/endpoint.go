@@ -563,8 +563,11 @@ func (e *endpoint) saveCache(ctx context.Context, cachePath string, signal <-cha
 				continue
 			}
 
-			// Grab the scan lock.
-			e.lockScanLock(context.Background())
+			// Grab the scan lock, but allow cancellation to terminate us if the
+			// lock is held by an operation that's already being torn down.
+			if !e.lockScanLock(ctx) {
+				return
+			}
 
 			// If the cache hasn't changed since the last write, then skip this
 			// save request.
@@ -675,8 +678,7 @@ func (e *endpoint) watchPoll(ctx context.Context, pollingInterval uint32, nonRec
 				logger.Debug("Polling terminated")
 
 				// Ensure that accelerated watching is disabled, if necessary.
-				if e.accelerationAllowed {
-					e.lockScanLock(context.Background())
+				if e.accelerationAllowed && e.lockScanLock(ctx) {
 					e.accelerate = false
 					e.unlockScanLock()
 				}
@@ -728,8 +730,12 @@ func (e *endpoint) watchPoll(ctx context.Context, pollingInterval uint32, nonRec
 			}
 		}
 
-		// Grab the scan lock.
-		e.lockScanLock(context.Background())
+		// Grab the scan lock, but don't let cancellation strand this Goroutine
+		// behind a long-running endpoint operation.
+		if !e.lockScanLock(ctx) {
+			logger.Debug("Polling terminated while waiting for scan lock")
+			return
+		}
 
 		// Disable the use of the existing scan results.
 		e.accelerate = false
@@ -879,8 +885,7 @@ WatchEstablishment:
 				logger.Debug("Watching terminated")
 
 				// Ensure that accelerated watching is disabled, if necessary.
-				if e.accelerationAllowed {
-					e.lockScanLock(context.Background())
+				if e.accelerationAllowed && e.lockScanLock(ctx) {
 					e.accelerate = false
 					e.recheckPaths = nil
 					e.unlockScanLock()
@@ -893,7 +898,10 @@ WatchEstablishment:
 				logger.Debug("Attempting to enable accelerated scanning")
 
 				// Attempt to perform a baseline scan to enable acceleration.
-				e.lockScanLock(context.Background())
+				if !e.lockScanLock(ctx) {
+					logger.Debug("Watching terminated while waiting for scan lock")
+					return
+				}
 				if err := e.scan(ctx, nil, nil); err != nil {
 					logger.Debug("Unable to perform baseline scan:", err)
 					timer.Reset(pollingDuration)
@@ -915,8 +923,7 @@ WatchEstablishment:
 
 				// If acceleration is allowed on the endpoint, then disable scan
 				// acceleration and clear out the re-check paths.
-				if e.accelerationAllowed {
-					e.lockScanLock(context.Background())
+				if e.accelerationAllowed && e.lockScanLock(ctx) {
 					e.accelerate = false
 					e.recheckPaths = nil
 					e.unlockScanLock()
@@ -971,7 +978,10 @@ WatchEstablishment:
 				// otherwise we're still in a pre-baseline scan state and don't
 				// need to record these events.
 				if e.accelerationAllowed {
-					e.lockScanLock(context.Background())
+					if !e.lockScanLock(ctx) {
+						logger.Debug("Watching terminated while updating recheck paths")
+						return
+					}
 					if e.accelerate {
 						e.recheckPaths[path] = true
 					}
@@ -1283,9 +1293,18 @@ func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) (
 		return nil, nil, false, errors.New("endpoint is in read-only mode")
 	}
 
-	// Grab the scan lock and defer its release.
-	e.lockScanLock(context.Background())
-	defer e.unlockScanLock()
+	// Grab the scan lock and defer its release. If the caller has already
+	// cancelled the transition, then don't allow lock acquisition to block the
+	// session shutdown path.
+	if !e.lockScanLock(ctx) {
+		return nil, nil, false, fmt.Errorf("transition cancelled: %w", context.Canceled)
+	}
+	scanLockHeld := true
+	defer func() {
+		if scanLockHeld {
+			e.unlockScanLock()
+		}
+	}()
 
 	// Verify that we've performed a scan since the last transition operation,
 	// that way our count check is valid. If we haven't, then the controller is
@@ -1333,6 +1352,7 @@ func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) (
 	// because these aren't updated concurrently and thus don't fall under the
 	// scope of the scan lock.
 	e.unlockScanLock()
+	scanLockHeld = false
 	results, problems, stagerMissingFiles := core.Transition(
 		ctx,
 		e.root,
@@ -1345,7 +1365,15 @@ func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) (
 		e.lastReturnedScanSnapshotDecomposesUnicode,
 		e.stager,
 	)
-	e.lockScanLock(context.Background())
+	if !e.lockScanLock(ctx) {
+		// If cancellation prevents re-acquiring the scan lock, then preserve the
+		// transition results so that the controller can still record any changes
+		// that made it to disk before shutdown. The remaining bookkeeping only
+		// matters if this endpoint will continue to be used.
+		e.stager.Finalize()
+		return results, problems, stagerMissingFiles, nil
+	}
+	scanLockHeld = true
 
 	// Determine whether or not the transition made any changes on disk.
 	var transitionMadeChanges bool
