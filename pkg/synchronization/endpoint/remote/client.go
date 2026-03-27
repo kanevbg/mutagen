@@ -372,7 +372,7 @@ func (c *endpointClient) Scan(ctx context.Context, ancestor *core.Entry, full bo
 }
 
 // Stage implements the Stage method for remote endpoints.
-func (c *endpointClient) Stage(paths []string, digests [][]byte) ([]string, []*rsync.Signature, rsync.Receiver, error) {
+func (c *endpointClient) Stage(ctx context.Context, paths []string, digests [][]byte) ([]string, []*rsync.Signature, rsync.Receiver, error) {
 	// Validate argument lengths and bail if there's nothing to stage.
 	if len(paths) != len(digests) {
 		return nil, nil, nil, errors.New("path count does not match digest count")
@@ -391,13 +391,34 @@ func (c *endpointClient) Stage(paths []string, digests [][]byte) ([]string, []*r
 		return nil, nil, nil, fmt.Errorf("unable to send stage request: %w", err)
 	}
 
-	// Receive the response and check for remote errors.
+	// Receive the response while monitoring for cancellation. If cancellation
+	// occurs, then forcibly close the endpoint stream to unblock the remote
+	// side, because the stage protocol has no out-of-band completion signal.
 	response := &StageResponse{}
-	if err := c.decoder.Decode(response); err != nil {
-		return nil, nil, nil, fmt.Errorf("unable to receive stage response: %w", err)
-	} else if err = response.ensureValid(paths); err != nil {
-		return nil, nil, nil, fmt.Errorf("invalid stage response: %w", err)
-	} else if response.Error != "" {
+	responseReceiveErrors := make(chan error, 1)
+	go func() {
+		if err := c.decoder.Decode(response); err != nil {
+			responseReceiveErrors <- fmt.Errorf("unable to receive stage response: %w", err)
+		} else if err = response.ensureValid(paths); err != nil {
+			responseReceiveErrors <- fmt.Errorf("invalid stage response: %w", err)
+		} else {
+			responseReceiveErrors <- nil
+		}
+	}()
+
+	select {
+	case err := <-responseReceiveErrors:
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	case <-ctx.Done():
+		c.closer.Close()
+		<-responseReceiveErrors
+		return nil, nil, nil, fmt.Errorf("stage cancelled: %w", ctx.Err())
+	}
+
+	// Check for remote errors.
+	if response.Error != "" {
 		return nil, nil, nil, fmt.Errorf("remote error: %s", response.Error)
 	}
 

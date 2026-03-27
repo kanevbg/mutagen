@@ -1252,7 +1252,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.stateLock.Unlock()
 		if paths, digests := core.TransitionDependencies(αTransitions); len(paths) > 0 {
 			c.logger.Debugf("Staging %d file(s) on alpha", len(paths))
-			filteredPaths, signatures, receiver, err := alpha.Stage(paths, digests)
+			filteredPaths, signatures, receiver, err := alpha.Stage(ctx, paths, digests)
 			if err != nil {
 				return fmt.Errorf("unable to begin staging on alpha: %w", err)
 			}
@@ -1263,6 +1263,12 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 				c.logger.Debugf("Alpha pre-staged %d/%d files", len(paths)-len(filteredPaths), len(paths))
 			}
 			if len(filteredPaths) > 0 {
+				select {
+				case <-ctx.Done():
+					return errors.New("cancelled before alpha supply")
+				default:
+				}
+
 				monitor := func(state *rsync.ReceiverState) error {
 					c.stateLock.Lock()
 					if state == nil {
@@ -1282,6 +1288,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 					return fmt.Errorf("unable to stage files on alpha: %w", err)
 				}
 			}
+			select {
+			case <-ctx.Done():
+				return errors.New("cancelled during alpha staging")
+			default:
+			}
 		}
 
 		// Stage files on beta.
@@ -1290,7 +1301,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.stateLock.Unlock()
 		if paths, digests := core.TransitionDependencies(βTransitions); len(paths) > 0 {
 			c.logger.Debugf("Staging %d file(s) on beta", len(paths))
-			filteredPaths, signatures, receiver, err := beta.Stage(paths, digests)
+			filteredPaths, signatures, receiver, err := beta.Stage(ctx, paths, digests)
 			if err != nil {
 				return fmt.Errorf("unable to begin staging on beta: %w", err)
 			}
@@ -1301,6 +1312,12 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 				c.logger.Debugf("Beta pre-staged %d/%d files", len(paths)-len(filteredPaths), len(paths))
 			}
 			if len(filteredPaths) > 0 {
+				select {
+				case <-ctx.Done():
+					return errors.New("cancelled before beta supply")
+				default:
+				}
+
 				monitor := func(state *rsync.ReceiverState) error {
 					c.stateLock.Lock()
 					if state == nil {
@@ -1319,6 +1336,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 				if err = alpha.Supply(filteredPaths, signatures, receiver); err != nil {
 					return fmt.Errorf("unable to stage files on beta: %w", err)
 				}
+			}
+			select {
+			case <-ctx.Done():
+				return errors.New("cancelled during beta staging")
+			default:
 			}
 		}
 

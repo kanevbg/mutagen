@@ -80,3 +80,31 @@ func TestTransitionPreemptsWhileWaitingForScanLock(t *testing.T) {
 		t.Fatal("transition hung while waiting for the scan lock")
 	}
 }
+
+func TestStagePreemptsWhileWaitingForScanLock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	scanLock := make(chan struct{}, 1)
+	scanLock <- struct{}{}
+	<-scanLock
+
+	endpoint := &endpoint{
+		scanLock: scanLock,
+	}
+
+	stageResults := make(chan error, 1)
+	go func() {
+		_, _, _, err := endpoint.Stage(ctx, []string{"file"}, [][]byte{{1}})
+		stageResults <- err
+	}()
+
+	select {
+	case err := <-stageResults:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal("stage did not report cancellation:", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stage hung while waiting for the scan lock")
+	}
+}

@@ -536,6 +536,72 @@ func (e *endpoint) unlockScanLock() {
 	e.scanLock <- struct{}{}
 }
 
+// preemptableReadSeekCloser wraps a file and checks for cancellation before
+// each read operation.
+type preemptableReadSeekCloser struct {
+	ctx  context.Context
+	file io.ReadSeekCloser
+}
+
+// Read implements io.Reader.Read.
+func (r *preemptableReadSeekCloser) Read(data []byte) (int, error) {
+	select {
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	default:
+	}
+	return r.file.Read(data)
+}
+
+// Seek implements io.Seeker.Seek.
+func (r *preemptableReadSeekCloser) Seek(offset int64, whence int) (int64, error) {
+	return r.file.Seek(offset, whence)
+}
+
+// Close implements io.Closer.Close.
+func (r *preemptableReadSeekCloser) Close() error {
+	return r.file.Close()
+}
+
+// copyWithPreemption copies data while checking for cancellation between read
+// and write operations.
+func copyWithPreemption(ctx context.Context, destination io.Writer, source io.Reader) error {
+	buffer := make([]byte, 32*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		count, readErr := source.Read(buffer)
+		if count > 0 {
+			written := 0
+			for written < count {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+
+				n, writeErr := destination.Write(buffer[written:count])
+				written += n
+				if writeErr != nil {
+					return writeErr
+				} else if n == 0 {
+					return io.ErrShortWrite
+				}
+			}
+		}
+
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		} else if readErr != nil {
+			return readErr
+		}
+	}
+}
+
 // saveCache serializes the cache and writes the result to disk at regular
 // intervals. It runs as a background Goroutine for all endpoints.
 func (e *endpoint) saveCache(ctx context.Context, cachePath string, signal <-chan struct{}) {
@@ -570,27 +636,30 @@ func (e *endpoint) saveCache(ctx context.Context, cachePath string, signal <-cha
 			}
 
 			// If the cache hasn't changed since the last write, then skip this
-			// save request.
-			if e.cache == lastSavedCache {
+			// save request. Otherwise, snapshot the cache pointer and release the
+			// scan lock before performing the disk write so that a slow cache save
+			// can't stall foreground synchronization work.
+			cacheToSave := e.cache
+			if cacheToSave == lastSavedCache {
 				e.unlockScanLock()
 				continue
 			}
+			e.unlockScanLock()
 
 			// Save the cache.
 			e.logger.Debug("Saving cache to disk")
-			if err := encoding.MarshalAndSaveProtobuf(cachePath, e.cache); err != nil {
+			if err := encoding.MarshalAndSaveProtobuf(cachePath, cacheToSave); err != nil {
 				e.logger.Error("Cache save failed:", err)
-				e.cacheWriteError = err
-				e.unlockScanLock()
+				if e.lockScanLock(ctx) {
+					e.cacheWriteError = err
+					e.unlockScanLock()
+				}
 				return
 			}
 
 			// Update our state.
-			lastSavedCache = e.cache
+			lastSavedCache = cacheToSave
 			lastSaveTime = now
-
-			// Release the cache lock.
-			e.unlockScanLock()
 		}
 	}
 }
@@ -1124,45 +1193,48 @@ func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, full bool) (*core.Sn
 // stageFromRoot attempts to perform staging from local files by using a reverse
 // lookup map.
 func (e *endpoint) stageFromRoot(
+	ctx context.Context,
 	path string,
 	digest []byte,
 	reverseLookupMap *core.ReverseLookupMap,
 	opener *filesystem.Opener,
-) bool {
+) (bool, error) {
 	// See if we can find a path within the root that has a matching digest.
 	sourcePath, sourcePathOk := reverseLookupMap.Lookup(digest)
 	if !sourcePathOk {
-		return false
+		return false, nil
 	}
 
 	// Open the source file and defer its closure.
 	source, _, err := opener.OpenFile(sourcePath)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	defer source.Close()
 
 	// Create a staging sink. We explicitly manage its closure below.
 	sink, err := e.stager.Sink(path)
 	if err != nil {
-		return false
+		return false, nil
 	}
 
 	// Copy data to the sink and close it, then check for copy errors.
-	_, err = io.Copy(sink, source)
-	sink.Close()
-	if err != nil {
-		return false
+	err = copyWithPreemption(ctx, sink, source)
+	closeErr := sink.Close()
+	if err != nil && ctx.Err() != nil {
+		return false, err
+	} else if err != nil || closeErr != nil {
+		return false, nil
 	}
 
 	// Verify that everything staged correctly, ensuring that the source file
 	// wasn't modified during the copy operation.
 	success, _ := e.stager.Contains(path, digest)
-	return success
+	return success, nil
 }
 
 // Stage implements the Stage method for local endpoints.
-func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.Signature, rsync.Receiver, error) {
+func (e *endpoint) Stage(ctx context.Context, paths []string, digests [][]byte) ([]string, []*rsync.Signature, rsync.Receiver, error) {
 	// If we're in a read-only mode, we shouldn't be staging files.
 	if e.readOnly {
 		return nil, nil, nil, errors.New("endpoint is in read-only mode")
@@ -1177,7 +1249,9 @@ func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.S
 
 	// Grab the scan lock. We'll need this to verify the last scan entry count
 	// and to generate the reverse lookup map.
-	e.lockScanLock(context.Background())
+	if !e.lockScanLock(ctx) {
+		return nil, nil, nil, fmt.Errorf("staging cancelled: %w", ctx.Err())
+	}
 
 	// Verify that we've performed a scan since the last staging operation, that
 	// way our count check is valid. If we haven't, then the controller is
@@ -1230,12 +1304,20 @@ func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.S
 	// If we manage to handle all files, then we can abort staging.
 	filteredPaths := paths[:0]
 	for p, path := range paths {
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, fmt.Errorf("staging cancelled: %w", ctx.Err())
+		default:
+		}
+
 		digest := digests[p]
 		if available, err := e.stager.Contains(path, digest); err != nil {
 			return nil, nil, nil, fmt.Errorf("unable to query file staging status: %w", err)
 		} else if available {
 			continue
-		} else if e.stageFromRoot(path, digest, reverseLookupMap, opener) {
+		} else if staged, err := e.stageFromRoot(ctx, path, digest, reverseLookupMap, opener); err != nil {
+			return nil, nil, nil, fmt.Errorf("staging cancelled: %w", err)
+		} else if staged {
 			continue
 		} else {
 			filteredPaths = append(filteredPaths, path)
@@ -1258,12 +1340,21 @@ func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.S
 	emptySignature := &rsync.Signature{}
 	signatures := make([]*rsync.Signature, len(filteredPaths))
 	for p, path := range filteredPaths {
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, fmt.Errorf("staging cancelled: %w", ctx.Err())
+		default:
+		}
+
 		if !rootExistsAndHasFileContents {
 			signatures[p] = emptySignature
 		} else if base, _, err := opener.OpenFile(path); err != nil {
 			signatures[p] = emptySignature
-		} else if signature, err := engine.Signature(base, 0); err != nil {
+		} else if signature, err := engine.Signature(&preemptableReadSeekCloser{ctx: ctx, file: base}, 0); err != nil {
 			base.Close()
+			if ctx.Err() != nil {
+				return nil, nil, nil, fmt.Errorf("staging cancelled: %w", err)
+			}
 			signatures[p] = emptySignature
 		} else {
 			base.Close()

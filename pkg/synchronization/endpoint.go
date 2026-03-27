@@ -50,7 +50,8 @@ type Endpoint interface {
 	// on the endpoint. This method is allowed to modify the provided argument
 	// slices. If the returned receiver fails, the endpoint should be considered
 	// tainted and not used (though shutdown can and should still be invoked).
-	Stage(paths []string, digests [][]byte) ([]string, []*rsync.Signature, rsync.Receiver, error)
+	// If the context is cancelled, then the method should abort promptly.
+	Stage(ctx context.Context, paths []string, digests [][]byte) ([]string, []*rsync.Signature, rsync.Receiver, error)
 
 	// Supply transmits files in a streaming fashion using the rsync algorithm
 	// to the specified receiver.
