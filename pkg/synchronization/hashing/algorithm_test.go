@@ -1,6 +1,7 @@
 package hashing
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -89,6 +90,44 @@ func TestAlgorithmDescription(t *testing.T) {
 				description,
 				testCase.expected,
 			)
+		}
+	}
+}
+
+// TestAlgorithmFactoryDeterministic verifies that hasher construction works for
+// all supported algorithms and yields deterministic results.
+func TestAlgorithmFactoryDeterministic(t *testing.T) {
+	testCases := []Algorithm{
+		Algorithm_AlgorithmSHA1,
+		Algorithm_AlgorithmSHA256,
+		Algorithm_AlgorithmXXH128,
+	}
+
+	payload := []byte("mutagen-hashing-determinism-payload")
+
+	for _, algorithm := range testCases {
+		if algorithm.SupportStatus() != AlgorithmSupportStatusSupported {
+			continue
+		}
+
+		factory := algorithm.Factory()
+		first := factory()
+		second := factory()
+
+		if _, err := first.Write(payload); err != nil {
+			t.Fatalf("unable to hash payload with %s (first hasher): %v", algorithm, err)
+		}
+		if _, err := second.Write(payload); err != nil {
+			t.Fatalf("unable to hash payload with %s (second hasher): %v", algorithm, err)
+		}
+
+		firstSum := first.Sum(nil)
+		secondSum := second.Sum(nil)
+		if len(firstSum) == 0 {
+			t.Fatalf("hash output empty for %s", algorithm)
+		}
+		if !bytes.Equal(firstSum, secondSum) {
+			t.Fatalf("non-deterministic hash output for %s", algorithm)
 		}
 	}
 }
