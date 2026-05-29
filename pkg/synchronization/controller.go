@@ -411,6 +411,30 @@ func (c *controller) flush(ctx context.Context, prompter string, skipWait bool) 
 	}
 }
 
+// stopSynchronizationLoop cancels any active synchronization loop and waits for
+// it to terminate.
+func (c *controller) stopSynchronizationLoop(ctx context.Context) error {
+	if c.cancel == nil {
+		return nil
+	}
+
+	// Cancel the synchronization loop and wait for it to finish.
+	c.cancel()
+	select {
+	case <-c.done:
+	case <-ctx.Done():
+		return fmt.Errorf("unable to wait for synchronization loop termination: %w", ctx.Err())
+	}
+
+	// Nil out any lifecycle state.
+	c.cancel = nil
+	c.flushRequests = nil
+	c.done = nil
+
+	// Success.
+	return nil
+}
+
 // resume attempts to reconnect and resume the session if it isn't currently
 // connected and synchronizing. If lifecycleLockHeld is true, then halt will
 // assume that the lifecycle lock is held by the caller and will not attempt to
@@ -459,13 +483,9 @@ func (c *controller) resume(ctx context.Context, prompter string, lifecycleLockH
 		// succeeds or even if the loop was already passed connections and it's
 		// just hasn't updated its status yet. But the only danger here is
 		// basically wasting those connections, and the window is very small.
-		c.cancel()
-		<-c.done
-
-		// Nil out any lifecycle state.
-		c.cancel = nil
-		c.flushRequests = nil
-		c.done = nil
+		if err := c.stopSynchronizationLoop(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Mark the session as unpaused and save it to disk.
@@ -565,7 +585,7 @@ func (m controllerHaltMode) description() string {
 // halt halts the session with the specified behavior. If lifecycleLockHeld is
 // true, then halt will assume that the lifecycle lock is held by the caller and
 // will not attempt to acquire it.
-func (c *controller) halt(_ context.Context, mode controllerHaltMode, prompter string, lifecycleLockHeld bool) error {
+func (c *controller) halt(ctx context.Context, mode controllerHaltMode, prompter string, lifecycleLockHeld bool) error {
 	// Update status.
 	prompting.Message(prompter, fmt.Sprintf("%s session %s...", mode.description(), c.session.Identifier))
 
@@ -587,14 +607,9 @@ func (c *controller) halt(_ context.Context, mode controllerHaltMode, prompter s
 
 	// Kill any existing synchronization loop.
 	if c.cancel != nil {
-		// Cancel the synchronization loop and wait for it to finish.
-		c.cancel()
-		<-c.done
-
-		// Nil out any lifecycle state.
-		c.cancel = nil
-		c.flushRequests = nil
-		c.done = nil
+		if err := c.stopSynchronizationLoop(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Handle based on the halt mode.

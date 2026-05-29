@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/identifier"
@@ -12,6 +13,12 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/state"
 	"github.com/mutagen-io/mutagen/pkg/url"
+)
+
+const (
+	// shutdownHaltTimeout is the maximum amount of time to wait for a session
+	// to halt during daemon shutdown.
+	shutdownHaltTimeout = 30 * time.Second
 )
 
 // Manager provides forwarding session management facilities. Its methods are
@@ -179,7 +186,10 @@ func (m *Manager) Shutdown() {
 	// log any that fail to halt.
 	for _, controller := range m.sessions {
 		m.logger.Info("Halting session", controller.session.Identifier)
-		if err := controller.halt(context.Background(), controllerHaltModeShutdown, ""); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+		err := controller.halt(ctx, controllerHaltModeShutdown, "")
+		cancel()
+		if err != nil {
 			m.logger.Warnf("Failed to halt session %s: %v", controller.session.Identifier, err)
 		}
 	}

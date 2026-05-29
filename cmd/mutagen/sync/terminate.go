@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -15,6 +16,12 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	promptingsvc "github.com/mutagen-io/mutagen/pkg/service/prompting"
 	synchronizationsvc "github.com/mutagen-io/mutagen/pkg/service/synchronization"
+)
+
+const (
+	// terminateTimeout is the maximum amount of time to wait for daemon-side
+	// termination to complete before returning control to the caller.
+	terminateTimeout = 2 * time.Minute
 )
 
 // TerminateWithSelection is an orchestration convenience method that performs a
@@ -42,7 +49,9 @@ func TerminateWithSelection(
 		Prompter:  prompter,
 		Selection: selection,
 	}
-	response, err := synchronizationService.Terminate(context.Background(), request)
+	terminateCtx, terminateCancel := context.WithTimeout(context.Background(), terminateTimeout)
+	response, err := synchronizationService.Terminate(terminateCtx, request)
+	terminateCancel()
 	promptingCancel()
 	<-promptingErrors
 	if err != nil {

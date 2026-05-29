@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/identifier"
@@ -16,6 +17,9 @@ import (
 )
 
 const (
+	// shutdownHaltTimeout is the maximum amount of time to wait for a session
+	// to halt during daemon shutdown.
+	shutdownHaltTimeout = 30 * time.Second
 	// maximumListConflicts is the maximum number of conflicts that will be
 	// reported by Manager.List for a single session before conflict list
 	// truncation for that session.
@@ -196,7 +200,10 @@ func (m *Manager) Shutdown() {
 	// log any that fail to halt.
 	for _, controller := range m.sessions {
 		m.logger.Info("Halting session", controller.session.Identifier)
-		if err := controller.halt(context.Background(), controllerHaltModeShutdown, "", false); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+		err := controller.halt(ctx, controllerHaltModeShutdown, "", false)
+		cancel()
+		if err != nil {
 			m.logger.Warnf("Failed to halt session %s: %v", controller.session.Identifier, err)
 		}
 	}
