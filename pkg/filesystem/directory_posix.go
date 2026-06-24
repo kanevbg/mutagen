@@ -42,6 +42,12 @@ func ensureValidName(name string) error {
 	return nil
 }
 
+// EnsureValidName verifies that the provided name is valid for use as a single
+// filesystem entry name on the current platform.
+func EnsureValidName(name string) error {
+	return ensureValidName(name)
+}
+
 // Directory represents a directory on disk and provides race-free operations on
 // the directory's contents. All of its operations avoid the traversal of
 // symbolic links.

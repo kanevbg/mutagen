@@ -35,6 +35,10 @@ func (e *testStageEndpoint) Supply([]string, []*rsync.Signature, rsync.Receiver)
 	panic("unexpected Supply call")
 }
 
+func (e *testStageEndpoint) FilterUnsupportedTransitions(transitions []*core.Change) ([]*core.Change, []*core.Problem, error) {
+	return transitions, nil, nil
+}
+
 func (e *testStageEndpoint) Transition(context.Context, []*core.Change) ([]*core.Entry, []*core.Problem, bool, error) {
 	panic("unexpected Transition call")
 }

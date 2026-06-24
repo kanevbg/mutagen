@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/state"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 )
 
 func TestShutdownPreemptsWorkersWaitingForScanLock(t *testing.T) {
@@ -106,5 +108,51 @@ func TestStagePreemptsWhileWaitingForScanLock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("stage hung while waiting for the scan lock")
+	}
+}
+
+func TestFilterUnsupportedTransitionsFiltersNestedUnsupportedContent(t *testing.T) {
+	old := &core.Entry{
+		Kind: core.EntryKind_Directory,
+		Contents: map[string]*core.Entry{
+			"kept.txt": {Kind: core.EntryKind_File, Digest: []byte{1}},
+		},
+	}
+	new := &core.Entry{
+		Kind: core.EntryKind_Directory,
+		Contents: map[string]*core.Entry{
+			"kept.txt":     {Kind: core.EntryKind_File, Digest: []byte{2}},
+			"invalid/name": {Kind: core.EntryKind_File, Digest: []byte{3}},
+		},
+	}
+
+	filtered, problems, err := (&endpoint{}).FilterUnsupportedTransitions([]*core.Change{{
+		Path: "root",
+		Old:  old,
+		New:  new,
+	}})
+	if err != nil {
+		t.Fatal("filter failed:", err)
+	}
+	if len(problems) != 1 {
+		t.Fatalf("unexpected problem count: %d", len(problems))
+	}
+	if problems[0].Path != "root/invalid/name" {
+		t.Error("unexpected problem path:", problems[0].Path)
+	}
+	if !strings.Contains(problems[0].Error, "path unsupported by target filesystem") {
+		t.Error("unexpected problem error:", problems[0].Error)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("unexpected filtered transition count: %d", len(filtered))
+	}
+	expected := &core.Entry{
+		Kind: core.EntryKind_Directory,
+		Contents: map[string]*core.Entry{
+			"kept.txt": {Kind: core.EntryKind_File, Digest: []byte{2}},
+		},
+	}
+	if !filtered[0].New.Equal(expected, true) {
+		t.Error("unsupported content not filtered from transition")
 	}
 }

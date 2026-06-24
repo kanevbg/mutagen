@@ -491,6 +491,14 @@ func (c *endpointClient) Supply(paths []string, signatures []*rsync.Signature, r
 	return nil
 }
 
+// FilterUnsupportedTransitions implements the FilterUnsupportedTransitions
+// method for remote endpoints. Remote endpoint filesystem capabilities aren't
+// currently available on the client side, so transition-time problem reporting
+// remains the fallback for unsupported remote paths.
+func (c *endpointClient) FilterUnsupportedTransitions(transitions []*core.Change) ([]*core.Change, []*core.Problem, error) {
+	return transitions, nil, nil
+}
+
 // Transition implements the Transition method for remote endpoints.
 func (c *endpointClient) Transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool, error) {
 	// Create and send the transition request.

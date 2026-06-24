@@ -1377,6 +1377,96 @@ func (e *endpoint) Supply(paths []string, signatures []*rsync.Signature, receive
 	return rsync.Transmit(e.root, paths, signatures, receiver)
 }
 
+// unsupportedTransitionPathProblem generates a transition problem for a path
+// that can't be represented by this endpoint.
+func unsupportedTransitionPathProblem(path string, err error) *core.Problem {
+	return &core.Problem{
+		Path:  path,
+		Error: fmt.Errorf("path unsupported by target filesystem: %w", err).Error(),
+	}
+}
+
+// transitionPathSupported checks whether a synchronization path can be
+// represented as a path on this endpoint.
+func transitionPathSupported(path string) error {
+	if path == "" {
+		return nil
+	}
+	for _, name := range strings.Split(path, "/") {
+		if err := filesystem.EnsureValidName(name); err != nil {
+			return fmt.Errorf("invalid path component %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// filterUnsupportedEntry removes any portions of entry whose paths can't be
+// represented by this endpoint.
+func filterUnsupportedEntry(path string, entry *core.Entry) (*core.Entry, []*core.Problem) {
+	if entry == nil || entry.Kind != core.EntryKind_Directory || len(entry.Contents) == 0 {
+		return entry, nil
+	}
+
+	var problems []*core.Problem
+	var modified bool
+	filtered := entry.Copy(core.EntryCopyBehaviorSlim)
+	filtered.Contents = make(map[string]*core.Entry, len(entry.Contents))
+	contentPathPrefix := fastpath.Joinable(path)
+	for name, child := range entry.Contents {
+		contentPath := contentPathPrefix + name
+		if err := filesystem.EnsureValidName(name); err != nil {
+			problems = append(problems, unsupportedTransitionPathProblem(
+				contentPath,
+				fmt.Errorf("invalid path component %q: %w", name, err),
+			))
+			modified = true
+			continue
+		}
+
+		filteredChild, childProblems := filterUnsupportedEntry(contentPath, child)
+		if len(childProblems) > 0 {
+			problems = append(problems, childProblems...)
+			modified = true
+		}
+		filtered.Contents[name] = filteredChild
+	}
+
+	if !modified {
+		return entry, nil
+	}
+	return filtered, problems
+}
+
+// FilterUnsupportedTransitions implements the FilterUnsupportedTransitions
+// method for local endpoints.
+func (e *endpoint) FilterUnsupportedTransitions(transitions []*core.Change) ([]*core.Change, []*core.Problem, error) {
+	var problems []*core.Problem
+	filteredTransitions := transitions[:0]
+	for _, transition := range transitions {
+		if err := transitionPathSupported(transition.Path); err != nil {
+			problems = append(problems, unsupportedTransitionPathProblem(transition.Path, err))
+			continue
+		}
+
+		filteredNew, transitionProblems := filterUnsupportedEntry(transition.Path, transition.New)
+		if len(transitionProblems) > 0 {
+			problems = append(problems, transitionProblems...)
+		}
+		if filteredNew.Equal(transition.Old, true) {
+			continue
+		}
+		if filteredNew != transition.New {
+			transition = &core.Change{
+				Path: transition.Path,
+				Old:  transition.Old,
+				New:  filteredNew,
+			}
+		}
+		filteredTransitions = append(filteredTransitions, transition)
+	}
+	return filteredTransitions, problems, nil
+}
+
 // Transition implements the Transition method for local endpoints.
 func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool, error) {
 	// If we're in a read-only mode, we shouldn't be performing transitions.

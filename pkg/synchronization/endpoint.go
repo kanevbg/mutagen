@@ -57,6 +57,14 @@ type Endpoint interface {
 	// to the specified receiver.
 	Supply(paths []string, signatures []*rsync.Signature, receiver rsync.Receiver) error
 
+	// FilterUnsupportedTransitions removes transition portions that the
+	// endpoint knows it cannot represent. Removed portions are reported as
+	// non-fatal transition problems so synchronization can continue for other
+	// paths without repeatedly staging content that can never be applied. The
+	// returned transition list must maintain the relative order of the provided
+	// list and may reuse entries from it.
+	FilterUnsupportedTransitions(transitions []*core.Change) ([]*core.Change, []*core.Problem, error)
+
 	// Transition performs the specified transitions on the endpoint. It returns
 	// the respective results of the specified change operations, a list of
 	// non-fatal problems encountered during the transition operation, a boolean

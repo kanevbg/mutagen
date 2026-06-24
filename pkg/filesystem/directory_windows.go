@@ -35,8 +35,26 @@ func ensureValidName(name string) error {
 		return errors.New("alternate path separator appears in name")
 	}
 
+	// Verify that no Windows-reserved characters appear in the name. These may
+	// be valid on other platforms, but they can't be represented through
+	// standard Windows filesystem APIs.
+	if strings.IndexAny(name, `<>:"|?*`) != -1 {
+		return errors.New("reserved character appears in name")
+	}
+	for _, r := range name {
+		if r >= 0 && r < 32 {
+			return errors.New("control character appears in name")
+		}
+	}
+
 	// Success.
 	return nil
+}
+
+// EnsureValidName verifies that the provided name is valid for use as a single
+// filesystem entry name on the current platform.
+func EnsureValidName(name string) error {
+	return ensureValidName(name)
 }
 
 // Directory represents a directory on disk and provides race-free operations on

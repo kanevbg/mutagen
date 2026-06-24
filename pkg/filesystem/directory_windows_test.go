@@ -82,3 +82,23 @@ func TestDirectoryLongPaths(t *testing.T) {
 		t.Error("unable to remove file with long name:", err)
 	}
 }
+
+func TestEnsureValidNameRejectsWindowsReservedCharacters(t *testing.T) {
+	for _, name := range []string{
+		`primary|global|plugin-list.php`,
+		`with:colon.php`,
+		`question?.txt`,
+		`asterisk*.txt`,
+		"control\x01.txt",
+	} {
+		if err := EnsureValidName(name); err == nil {
+			t.Error("name accepted despite reserved Windows character:", name)
+		}
+	}
+}
+
+func TestEnsureValidNameAcceptsNormalWindowsName(t *testing.T) {
+	if err := EnsureValidName("plugin-list.php"); err != nil {
+		t.Error("normal Windows name rejected:", err)
+	}
+}

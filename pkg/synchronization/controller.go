@@ -1267,6 +1267,19 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			return errHaltedForSafety
 		}
 
+		// Filter transition portions that endpoints know they can't represent
+		// before staging. This preserves visibility via transition problems
+		// while avoiding repeated staging and transition attempts for paths that
+		// can never be applied on the target filesystem.
+		αTransitions, αPreflightProblems, err := alpha.FilterUnsupportedTransitions(αTransitions)
+		if err != nil {
+			return fmt.Errorf("unable to filter unsupported alpha transitions: %w", err)
+		}
+		βTransitions, βPreflightProblems, err := beta.FilterUnsupportedTransitions(βTransitions)
+		if err != nil {
+			return fmt.Errorf("unable to filter unsupported beta transitions: %w", err)
+		}
+
 		// Stage files on alpha.
 		c.stateLock.Lock()
 		c.state.Status = Status_StagingAlpha
@@ -1375,7 +1388,8 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.state.Status = Status_Transitioning
 		c.stateLock.Unlock()
 		var αResults, βResults []*core.Entry
-		var αProblems, βProblems []*core.Problem
+		αProblems := αPreflightProblems
+		βProblems := βPreflightProblems
 		var αMissingFiles, βMissingFiles bool
 		var αTransitionErr, βTransitionErr error
 		var αChanges, βChanges []*core.Change
@@ -1389,7 +1403,9 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		if len(αTransitions) > 0 {
 			c.logger.Debug("Transitioning alpha")
 			go func() {
-				αResults, αProblems, αMissingFiles, αTransitionErr = alpha.Transition(ctx, αTransitions)
+				var problems []*core.Problem
+				αResults, problems, αMissingFiles, αTransitionErr = alpha.Transition(ctx, αTransitions)
+				αProblems = append(αProblems, problems...)
 				if αTransitionErr == nil {
 					for t, transition := range αTransitions {
 						αChanges = append(αChanges, &core.Change{Path: transition.Path, New: αResults[t]})
@@ -1401,7 +1417,9 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		if len(βTransitions) > 0 {
 			c.logger.Debug("Transitioning beta")
 			go func() {
-				βResults, βProblems, βMissingFiles, βTransitionErr = beta.Transition(ctx, βTransitions)
+				var problems []*core.Problem
+				βResults, problems, βMissingFiles, βTransitionErr = beta.Transition(ctx, βTransitions)
+				βProblems = append(βProblems, problems...)
 				if βTransitionErr == nil {
 					for t, transition := range βTransitions {
 						βChanges = append(βChanges, &core.Change{Path: transition.Path, New: βResults[t]})
