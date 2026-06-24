@@ -2,3 +2,7 @@
 /build/
 
 .idea/
+
+# Local
+/AGENTS.MD
+/AGENTS.md
